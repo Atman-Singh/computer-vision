@@ -1,20 +1,21 @@
-# weather-ai-app (Working Title)
+# computer-vision
 
 ## Project Details
-recommends outfits based on the day's weather.
+For learning about machine learning applications in computer vision
 
 # Project Setup
 
 ## Python
+Python &ge; 3.10
 
-### Virtual Environment
--  Activate virtual environment by running the following command in your terminal:
-   `(project folder path)\Scripts\activate`
--  To launch jupyter lab, run the command `jupyter lab`
--  When you need to install a libary, perform the installation using pip **while in the virtual environment** to keep everything contained within the venv.
--  Before pushing code to the remote repository, update the *requirements.txt* file by running `pip freeze --local` in the venv and copying the output to *requirements.txt* (overwrite what's there)
+## Virtual Environment
+Create and activate conda environment\
+`conda create --name cnn python=3.12`\
+`conda activate cnn`
 
-### Installing Dependencies 
--  Install python libraries by navigating to the project directory running the following command:
-   `pip install -r requirements.txt`
+## Launch JupyterLab
+from project root:
+`jupyter-lab`
 
+## Installing Dependencies 
+`pip install -r requirements.txt`
