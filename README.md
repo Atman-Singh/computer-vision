@@ -3,7 +3,8 @@
 ## Project Details
 Building ML models for various computer vision applications from scratch
 
-Currently working on: creating a convolutional neural network to classify numbers from the mnist dataset
+Currently working on: creating a convolutional neural network to classify numbers from the mnist dataset\
+Look at: infrastructure\convolutional_neural_network.py
 
 # Project Setup
 
