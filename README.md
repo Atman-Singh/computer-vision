@@ -1,7 +1,7 @@
 # computer-vision
 
 ## Project Details
-Building ML models for various computer vision applications from scratch\
+Building ML models for various computer vision applications from scratch
 
 Currently working on: creating a convolutional neural network to classify numbers from the mnist dataset
 
