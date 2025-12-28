@@ -1,7 +1,9 @@
 # computer-vision
 
 ## Project Details
-For learning about machine learning applications in computer vision
+Building ML models for various computer vision applications from scratch\
+
+Currently working on: creating a convolutional neural network to classify numbers from the mnist dataset
 
 # Project Setup
 
