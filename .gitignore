@@ -1,2 +1,6 @@
 Lib/
 .ipynb_checkpoints/
+logs/
+etc/
+share/
+data/

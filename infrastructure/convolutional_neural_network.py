@@ -3,18 +3,46 @@ import torch
 import torch.nn.functional as F
 from torch.func import vmap
 import time
+import logging
+from logging import Logger
+from pathlib import Path
+import os
+import sys
+from safetensors.torch import save_file
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 class ConvolutionalNeuralNetwork:
 
-    def __init__(self, width: int, height: int, ds: DatasetDict, learning_rate: float):
+    def __init__(self, width: int, height: int, ds: DatasetDict, learning_rate: float, logger: Logger | None = None):
+        
+        # logging
+        if logger:
+            self.logger = logger
+        else:
+            level = logging.INFO
+
+            logs_dir = ROOT_DIR / "logs"
+            self.logger = logging.getLogger(__name__)
+            logging.basicConfig(filename=str(logs_dir / f'{__name__}.log'), level=level)
+
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setLevel(level) # Set the console handler's level
+
+            formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+            ch.setFormatter(formatter)
+
+            self.logger.addHandler(ch)
+
+        self.logger.info('Logger initialized succesfully')
 
         if torch.cuda.is_available():
-            print("CUDA is available. PyTorch can use the GPU.")
-            print(f"Number of GPUs: {torch.cuda.device_count()}")
-            print(f"Current GPU name: {torch.cuda.get_device_name(0)}")
-            print(f"CUDA Version built with PyTorch: {torch.version.cuda}")
+            self.logger.info("CUDA is available. PyTorch can use the GPU.")
+            self.logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
+            self.logger.info(f"Current GPU name: {torch.cuda.get_device_name(0)}")
+            self.logger.info(f"CUDA Version built with PyTorch: {torch.version.cuda}")
         else:
-            print("CUDA is not available. PyTorch will use the CPU.")
+            self.logger.warning("CUDA is not available. PyTorch will use the CPU.")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,7 +57,7 @@ class ConvolutionalNeuralNetwork:
         width = width
         height = height
         if width != height:
-            print('TODO: support for non-square images')
+            self.logger.info('TODO: support for non-square images')
 
         self.images = torch.empty((rows, width, height), dtype=torch.int64, device=self.device)
         for i, row in enumerate(ds['train'].select(range(rows))):
@@ -61,36 +89,52 @@ class ConvolutionalNeuralNetwork:
         self.activation_functions = ['relu', 'relu']
 
         self.input_x = self.images[:self.images_processed]
-        self.train(epochs=200)
 
     def train(self, epochs):
         torch.cuda.synchronize()
         start = time.perf_counter()
-        for _ in range(epochs):
+        for i in range(epochs):
             output_conv = self.forward(self.input_x, self.kernel_stacks, self.weights, self.biases, self.activation_functions, (2,2))
-            print(output_conv[-1][1].shape)
+            self.logger.debug(output_conv[-1][1].shape)
             self.weights = output_conv[-1][1]
 
             cost = self._compute_cost(output_conv[-1][-1], self.ds)
             deltas = self.backward(output_conv, self.kernel_stacks, self.biases, self.input_x, self.output_range)
             self._update_parameters(self.kernel_stacks, self.biases, self.weights, deltas)
-            print('----------------------')
-            print(cost)
-            print('----------------------')
+            elapsed = time.perf_counter()-start
+            min, sec = elapsed // 60, int(elapsed % 60)
+            self.logger.info(f'Epoch {i+1}: cost reduced to {cost.mean():4f} over {int(min)}min, {sec}s')
 
         torch.cuda.synchronize()
         end = time.perf_counter()
-        print(f'Finished CNN training in {end-start:.2f}s')
+        self.logger.info(f'Finished CNN training in {end-start:.2f}s')
+
+        tensors_dir = ROOT_DIR / "data" / "output" / "cnn" / "fresh"
+        os.makedirs(tensors_dir, exist_ok=True)
+
+        # export weights & biases
+        state = {}
+        for i, kernel_stack in enumerate(self.kernel_stacks):
+            state[f'layer{i}.kernels'] = kernel_stack
+        for i, bias in enumerate(self.biases):
+            state[f'layer{i}.bias'] = bias
+        state['fc.weights'] = self.weights
+        save_file(
+            state,
+            tensors_dir / "model.safetensors"
+        )
+
+        self.logger.info(f'Saved weights & biases to {str(tensors_dir)}')
 
     # update weights and biases using deltas returned by backpropagation
     def _update_parameters(self, kernel_stacks: list, biases: list, weights: torch.Tensor, deltas: list):
         for i in range(len(kernel_stacks)):
             # TODO: add support for multiple kenrel channels
             _, kernel_d, bias_d = deltas[i]
-            print(kernel_stacks[i].shape, kernel_d.shape)
+            self.logger.debug(kernel_stacks[i].shape, kernel_d.shape)
             # unsqueeze is temp fix for above todo
             kernel_stacks[i] = kernel_stacks[i] - self.learning_rate * kernel_d.unsqueeze(1)
-            print(biases[i].shape, bias_d.shape)
+            self.logger.debug(biases[i].shape, bias_d.shape)
             # unsqueeze is temp fix for above todo
             biases[i] = biases[i] - self.learning_rate * bias_d.unsqueeze(-1)
         weights_d, bias_d = deltas[-1]
@@ -107,7 +151,7 @@ class ConvolutionalNeuralNetwork:
     # computes convolution between kernel and matrix
     def _traverse_matrix(self, matrix: torch.Tensor, kernel: torch.Tensor, step: int) -> torch.Tensor:
         if len(kernel.shape) == 2:
-            print('warning: kernel rank is 2, adjusting shape')
+            self.logger.debug('warning: kernel rank is 2, adjusting shape')
             kernel = kernel.unsqueeze(0)
         if len(kernel.shape) != 3:
             raise Exception(f"kernel has a rank of {len(kernel.shape)}")
@@ -163,18 +207,13 @@ class ConvolutionalNeuralNetwork:
         if len(kernel_stacks) > len(biases):
             raise Exception(f'number of kernel stacks {len(kernel_stacks)} greater than number of biases ({len(biases)})')
         if len(kernel_stacks) != len(activation_functions):
-            print(f"Number of kernel stacks inputted ({len(kernel_stacks)}) does " +
+            self.logger.warning(f"Number of kernel stacks inputted ({len(kernel_stacks)}) does " +
                 f"not equal number of activation functions inputted " +
                 f"({len(activation_functions)})")
 
         for i in range(len(kernel_stacks)):
-            print()
-            print(kernel_stacks[i].shape)
             kernel_stacks[i] = kernel_stacks[i].unsqueeze(0).expand(self.images_processed, *kernel_stacks[i].shape)
             kernel_stacks[i] = kernel_stacks[i].reshape(-1, *kernel_stacks[i].shape[-3:])
-            
-            print(kernel_stacks[i].shape)
-            print()
 
         for i, bias in enumerate(biases):
             if i < len(kernel_stacks):
@@ -200,7 +239,7 @@ class ConvolutionalNeuralNetwork:
             
             # take convolution
             convolution = vmap(self._traverse_matrix, in_dims=(0,0,None))(input_stack, kernel_stack, 1) 
-            print(convolution.shape, biases[i].shape)
+            self.logger.debug(convolution.shape, biases[i].shape)
             convolution = convolution + biases[i]
             # take activation
             activation = func(convolution)
@@ -230,9 +269,6 @@ class ConvolutionalNeuralNetwork:
 
         # compute fully connected layer output
         eps = 1e-7
-        print()
-        print('last b', biases[-1].shape)
-        print()
         fc_output = (weights @ flattened.T + biases[-1]).squeeze(0)
         func = torch.nn.Sigmoid()
         activation = torch.clamp(
@@ -389,18 +425,16 @@ class ConvolutionalNeuralNetwork:
             # compute deltas for biases, averaged and used to update biases
             convolution_d_seperated = self._seperate(convolution_d, self.images_processed)
             bias_d = convolution_d_seperated.sum((0,2,3)) / self.images_processed
-            print(bias_d.shape)
+            self.logger.debug(bias_d.shape)
             
             deltas[i] = (convolution_d, kernel_d, bias_d)
         deltas[-1] = (weights_d, biases_fc_d)
 
         for i in range(len(kernel_stacks)):
             kernel_stacks[i] = kernel_stacks[i][:kernel_stacks[i].shape[0] // self.images_processed]
-            print('end')
-            print(kernel_stacks[i].shape)
+            self.logger.debug(kernel_stacks[i].shape)
         
         for i in range(len(kernel_stacks)):
             biases[i] = biases[i][:biases[i].shape[0] // self.images_processed].squeeze(-1)
-            print(biases[i].shape)
 
         return deltas
