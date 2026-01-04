@@ -14,8 +14,11 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 class ConvolutionalNeuralNetwork:
 
-    def __init__(self, width: int, height: int, ds: DatasetDict, learning_rate: float, logger: Logger | None = None):
-        
+    def __init__(self, pool_size: tuple, ds: DatasetDict, learning_rate: float, learning_rate_decay: float | None = None,
+                 decay_step: int | None = None,
+                 kernel_stacks: list | None = None, biases: list | None = None, weights: torch.Tensor | None = None, 
+                 activation_functions: list | None = None, logger: Logger | None = None,
+                 ):
         # logging
         if logger:
             self.logger = logger
@@ -45,7 +48,7 @@ class ConvolutionalNeuralNetwork:
             self.logger.warning("CUDA is not available. PyTorch will use the CPU.")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        
         self.ds = ds
         labels = set()
         for l in ds['train']['label']:
@@ -53,61 +56,121 @@ class ConvolutionalNeuralNetwork:
         self.output_range = len(labels)
         
         # convert pngs to tensors containing pixel values
-        rows = len(ds['train'])
-        width = width
-        height = height
+        self.rows = len(ds['train'])
+        height, width = ds['train']['image'][0].size
         if width != height:
             self.logger.info('TODO: support for non-square images')
+        self.images = torch.empty((self.rows, width, height), dtype=torch.float32, device=self.device)
+        for i, row in enumerate(ds['train'].select(range(self.rows))):
+            self.images[i] = torch.tensor(
+                list(row['image'].getdata()), 
+                device=self.device, 
+                dtype=torch.float32
+            ).reshape(width, height) / 255.0
 
-        self.images = torch.empty((rows, width, height), dtype=torch.int64, device=self.device)
-        for i, row in enumerate(ds['train'].select(range(rows))):
-            self.images[i] = torch.reshape(torch.tensor(list(row['image'].getdata()), device=self.device), (width, height))
+        self.pool_size = pool_size
 
-        self.learning_rate = learning_rate
+        self.learning_rate, self.learning_rate_decay, self.decay_step = learning_rate, learning_rate_decay, decay_step
 
         # define kernels
         torch.manual_seed(3500)
-        min_fence = -0.2
-        max_fence = 0.2
+        if kernel_stacks:
+            self.kernel_stacks = kernel_stacks
+        else:
+            min_fence = -0.2
+            max_fence = 0.2
 
-        # initialize kernels with random values and transform them to range [-0.2, 0.2)
-        self.kernel_l1 = torch.rand(2, 1, 5, 5, device=self.device) * (max_fence - min_fence) + min_fence
-        self.kernel_l2 = torch.rand(4, 1, 3, 3, device=self.device) * (max_fence - min_fence) + min_fence
-
+            # initialize kernels with random values and transform them to range [-0.2, 0.2)
+            # 0: # of output channels
+            # 1: # of inputs per output channel
+            # 2, 3: rows, cols
+            # num of kernels = inputs * outputs
+            kernel_l1 = torch.rand(2, 1, 5, 5, device=self.device) * (max_fence - min_fence) + min_fence
+            kernel_l2 = torch.rand(2, 2, 3, 3, device=self.device) * (max_fence - min_fence) + min_fence
+            self.kernel_stacks = [kernel_l1, kernel_l2]
+        
         # initialize biases
-        self.bias_l1 = torch.rand(2, 1, device=self.device) * (max_fence - min_fence) + min_fence
-        self.bias_l2 = torch.rand(4, 1, device=self.device) * (max_fence - min_fence) + min_fence
+        if biases:
+            self.biases = biases
+        else:
+            bias_l1 = torch.rand(2, 1, device=self.device) * (max_fence - min_fence) + min_fence
+            bias_l2 = torch.rand(2, 2, device=self.device) * (max_fence - min_fence) + min_fence
+            self.biases = [bias_l1, bias_l2]
 
-        self.kernel_stacks = [self.kernel_l1, self.kernel_l2]
-        self.biases = [self.bias_l1, self.bias_l2]
-        self.images_processed = 0
+        # initialize fully connected layer weights
+        self.weights = weights
 
-        if self.images_processed == 0:
-            self.images_processed = rows
+        # activation functions
+        if activation_functions:
+            self.activation_functions = activation_functions
+        else:
+            self.activation_functions = ['relu', 'relu']
+    
+    def _inference(self, data: torch.Tensor, i: int) -> torch.Tensor:
+        output_v = self.forward(
+            data, 
+            self.kernel_stacks, 
+            self.weights, 
+            self.biases, 
+            self.activation_functions, 
+            self.pool_size,
+            i
+        )[-1][-1]
+        return output_v.max(dim=0).indices
 
-        self.weights = None
-        self.activation_functions = ['relu', 'relu']
+    def test_inference(self, i: int | None = None) -> float:
+        if i is None:
+            i = len(self.images)
+        labels = torch.tensor(self.ds['train'][:i]['label'], device=self.device)
+        output = self._inference(self.images[:i], i)
+        truth = labels == output
+        score = truth.sum() / i
+        return round(score.item(), 4)
 
-        self.input_x = self.images[:self.images_processed]
-
-    def train(self, epochs):
+    def train(self, epochs: int, images_processed: int | None = None):
         torch.cuda.synchronize()
         start = time.perf_counter()
+
+        if images_processed is None:
+            images_processed = self.rows
+        input_x = self.images[:images_processed]
+        prev_cost, cost = None, None
         for i in range(epochs):
-            output_conv = self.forward(self.input_x, self.kernel_stacks, self.weights, self.biases, self.activation_functions, (2,2))
+            if prev_cost is not None and cost > prev_cost:
+                self.learning_rate *= self.learning_rate_decay 
+
+            output_conv = self.forward(
+                input_x, 
+                self.kernel_stacks, 
+                self.weights, self.biases, 
+                self.activation_functions, 
+                self.pool_size, 
+                images_processed
+            )
+            # append initialized fully connected biases
+            if len(self.biases) == len(self.kernel_stacks):
+                self.biases.append(output_conv[-1][-2])
+
             self.logger.debug(output_conv[-1][1].shape)
             self.weights = output_conv[-1][1]
 
+            prev_cost = cost
             cost = self._compute_cost(output_conv[-1][-1], self.ds)
-            deltas = self.backward(output_conv, self.kernel_stacks, self.biases, self.input_x, self.output_range)
-            self._update_parameters(self.kernel_stacks, self.biases, self.weights, deltas)
+            deltas = self.backward(output_conv, self.kernel_stacks, input_x, self.output_range, images_processed)
+            self.kernel_stacks, self.biases, self.weights = self._get_updated_parameters(self.kernel_stacks, self.biases, self.weights, deltas)
+
             elapsed = time.perf_counter()-start
             min, sec = elapsed // 60, int(elapsed % 60)
-            self.logger.info(f'Epoch {i+1}: cost reduced to {cost.mean():4f} over {int(min)}min, {sec}s')
+            self.logger.info(f'Epoch {i+1}: cost reduced to {cost:4f} over {int(min)}min, {sec}s')
+            # self.logger.info(
+            #     f"grad norms: fcW={deltas[-1][0].norm().item():.3e} "
+            #     f"k1={deltas[0][1].norm().item():.3e} k2={deltas[1][1].norm().item():.3e}"
+            # )
 
         torch.cuda.synchronize()
-        end = time.perf_counter()
-        self.logger.info(f'Finished CNN training in {end-start:.2f}s')
+        elapsed = time.perf_counter() - start
+        min, sec = elapsed // 60, int(elapsed % 60)
+        self.logger.info(f'Finished CNN training in {int(min)}min, {sec}s')
 
         tensors_dir = ROOT_DIR / "data" / "output" / "cnn" / "fresh"
         os.makedirs(tensors_dir, exist_ok=True)
@@ -115,9 +178,9 @@ class ConvolutionalNeuralNetwork:
         # export weights & biases
         state = {}
         for i, kernel_stack in enumerate(self.kernel_stacks):
-            state[f'layer{i}.kernels'] = kernel_stack
+            state[f'layer{i+1}.kernels'] = kernel_stack
         for i, bias in enumerate(self.biases):
-            state[f'layer{i}.bias'] = bias
+            state[f'layer{i+1}.bias'] = bias
         state['fc.weights'] = self.weights
         save_file(
             state,
@@ -127,19 +190,20 @@ class ConvolutionalNeuralNetwork:
         self.logger.info(f'Saved weights & biases to {str(tensors_dir)}')
 
     # update weights and biases using deltas returned by backpropagation
-    def _update_parameters(self, kernel_stacks: list, biases: list, weights: torch.Tensor, deltas: list):
+    def _get_updated_parameters(self, kernel_stacks: list, biases: list, weights: torch.Tensor, deltas: list) -> tuple:
+        # convolutional pipeline updates
+        updated_kernels, updated_biases = [], []
         for i in range(len(kernel_stacks)):
-            # TODO: add support for multiple kenrel channels
             _, kernel_d, bias_d = deltas[i]
-            self.logger.debug(kernel_stacks[i].shape, kernel_d.shape)
-            # unsqueeze is temp fix for above todo
-            kernel_stacks[i] = kernel_stacks[i] - self.learning_rate * kernel_d.unsqueeze(1)
-            self.logger.debug(biases[i].shape, bias_d.shape)
-            # unsqueeze is temp fix for above todo
-            biases[i] = biases[i] - self.learning_rate * bias_d.unsqueeze(-1)
+            updated_kernels.append(kernel_stacks[i] - self.learning_rate * kernel_d)
+            updated_biases.append(biases[i] - self.learning_rate * bias_d)
+            
+        # fully connected layer updates
         weights_d, bias_d = deltas[-1]
-        weights -= self.learning_rate * weights_d
-        biases[-1] = biases[-1] - self.learning_rate * bias_d.unsqueeze(1)
+        updated_weights = weights - self.learning_rate * weights_d
+        updated_biases.append(biases[-1] - self.learning_rate * bias_d.unsqueeze(-1))
+
+        return (updated_kernels, updated_biases, updated_weights)
 
     # helper function to divide out rows from first dimension of tensor
     def _seperate(self, tensor: torch.Tensor, i: int):
@@ -150,25 +214,18 @@ class ConvolutionalNeuralNetwork:
 
     # computes convolution between kernel and matrix
     def _traverse_matrix(self, matrix: torch.Tensor, kernel: torch.Tensor, step: int) -> torch.Tensor:
-        if len(kernel.shape) == 2:
-            self.logger.debug('warning: kernel rank is 2, adjusting shape')
-            kernel = kernel.unsqueeze(0)
-        if len(kernel.shape) != 3:
-            raise Exception(f"kernel has a rank of {len(kernel.shape)}")
+        if len(kernel.shape) != 2:
+            print(f"kernel has a rank of {len(kernel.shape)}")
         
-        width, height = matrix.shape[1] - kernel.shape[-2] + 1, matrix.shape[0] - kernel.shape[-1] + 1
-
+        kh, kw = kernel.shape[-2], kernel.shape[-1]
         # create tensor of all windows kernel will slide over and repeat by number of kernels
         matrix_unfolded = (
             matrix
-                .unfold(0, width, step)
-                .unfold(1, height, step)
-                .permute(2,3,0,1)
+                .unfold(0, kh, step)
+                .unfold(1, kw, step)
         )
-
-        kernel = kernel.unsqueeze(1).unsqueeze(1)
         unfolded_sum = kernel * matrix_unfolded
-        return unfolded_sum.sum(dim=(-1,-2)).sum(0)
+        return unfolded_sum.sum(dim=(-1,-2))
 
     # computes maxpooling of matrix
     def _max_pool(self, matrix: torch.Tensor, pool_size: tuple) -> torch.Tensor:
@@ -197,9 +254,9 @@ class ConvolutionalNeuralNetwork:
             weights: torch.Tensor, 
             biases: list, 
             activation_functions: list, 
-            pool_size: tuple
+            pool_size: tuple,
+            images_processed: int
             ) -> list:
-        
         if not (isinstance(data, torch.Tensor) or isinstance(data, list)):
             raise Exception(f"Data is not of type 'list', inputted type is: {type(data)}")
         if not isinstance(kernel_stacks, list):
@@ -210,21 +267,8 @@ class ConvolutionalNeuralNetwork:
             self.logger.warning(f"Number of kernel stacks inputted ({len(kernel_stacks)}) does " +
                 f"not equal number of activation functions inputted " +
                 f"({len(activation_functions)})")
-
-        for i in range(len(kernel_stacks)):
-            kernel_stacks[i] = kernel_stacks[i].unsqueeze(0).expand(self.images_processed, *kernel_stacks[i].shape)
-            kernel_stacks[i] = kernel_stacks[i].reshape(-1, *kernel_stacks[i].shape[-3:])
-
-        for i, bias in enumerate(biases):
-            if i < len(kernel_stacks):
-                biases[i] = (
-                    bias
-                    .repeat(self.images_processed,1)
-                    .unsqueeze(-1)
-                )
-        
         # define working input
-        input_stack = data
+        input_stack = data.unsqueeze(1)
         output = [None for _ in range(len(kernel_stacks)+1)]
         for i, kernel_stack in enumerate(kernel_stacks):
             # initialize activation func
@@ -235,16 +279,21 @@ class ConvolutionalNeuralNetwork:
                 elif activation_functions[i].lower() != 'relu':
                     raise Exception(f'Activation function "{activation_functions[i]}" ' +
                                 f"is not a valid activation function.")
-            input_stack = input_stack.repeat_interleave(kernel_stack.shape[0] // input_stack.shape[0], dim=0)
-            
             # take convolution
-            convolution = vmap(self._traverse_matrix, in_dims=(0,0,None))(input_stack, kernel_stack, 1) 
+            # img, kernel, step
+            conv_single = vmap(self._traverse_matrix, in_dims=(0, 0, None))
+            conv_over_kernels = vmap(conv_single, in_dims=(None,0,None))
+            convolution = vmap(conv_over_kernels, in_dims=(0, None, None))(input_stack, kernel_stack, 1)
+
             self.logger.debug(convolution.shape, biases[i].shape)
-            convolution = convolution + biases[i]
+            convolution = convolution + biases[i].unsqueeze(-1).unsqueeze(-1)
             # take activation
             activation = func(convolution)
             # pool activation
-            pooled = vmap(self._max_pool, in_dims=(0,None))(activation, pool_size)
+            pooled = self._seperate(
+                vmap(self._max_pool, in_dims=(0,None))(activation.flatten(end_dim=2), pool_size),
+                images_processed
+            )
 
             # update output
             output[i] = (convolution, activation, pooled)
@@ -252,11 +301,7 @@ class ConvolutionalNeuralNetwork:
             input_stack = pooled
 
         # flattening
-        flattened = (
-            self._seperate(pooled, self.images_processed)
-            .flatten(1)
-            .unsqueeze(-1)
-        )
+        flattened = pooled.flatten(1)
 
         # initialize weights and biases for fully connected layer if not already
         if weights is None and len(biases) == len(kernel_stacks):
@@ -268,36 +313,21 @@ class ConvolutionalNeuralNetwork:
             biases.append(torch.rand(self.output_range, 1, device=self.device) * (max_fence - min_fence) + min_fence)
 
         # compute fully connected layer output
-        eps = 1e-7
-        fc_output = (weights @ flattened.T + biases[-1]).squeeze(0)
-        func = torch.nn.Sigmoid()
-        activation = torch.clamp(
-            func(fc_output), 
-            eps, 
-            1-eps
-        )
-        output[-1] = (flattened, weights, biases, activation)
+        logits = (weights @ flattened.T + biases[-1]).squeeze(0)
+        output[-1] = (flattened, weights, biases[-1], logits)
         
         return output
 
     # binary cross-entropy loss function
     def _compute_loss(self, a: torch.Tensor, y: torch.Tensor):
-        return y * torch.log(a) + (1 - y) * torch.log(1 - a) 
+        return -(y * torch.log(a) + (1 - y) * torch.log(1 - a))
 
     # function to compute cost of output for all images
-    def _compute_cost(self, output: torch.Tensor, dataset: DatasetDict):
-        cost = torch.zeros(self.output_range, device=self.device)
-        self.images_processed = output.shape[-1]
-        for i in range(output.shape[1]):
-            label = dataset['train'][i]['label']
-            eps = 1e-7
-            output_v = torch.clamp(output[:, i], eps, 1-eps)
-            expected_v = torch.zeros(self.output_range, device=self.device)
-            expected_v[label] = 1
-            
-            cost += self._compute_loss(output_v, expected_v)
-        cost /= self.images_processed
-        return -cost.unsqueeze(1)
+    def _compute_cost(self, logits: torch.Tensor, dataset: DatasetDict):
+        # TODO: code myself
+        labels = torch.tensor(dataset['train'][:logits.shape[1]]['label'], device=self.device)
+        loss = F.cross_entropy(logits.T, labels, reduction="mean")  
+        return loss
 
     # compute delta for pooled matrix (dA/dL)
     def _max_pool_d(self, matrix: torch.Tensor, pooled_d: torch.Tensor, pool_size: tuple) -> torch.Tensor:
@@ -336,30 +366,34 @@ class ConvolutionalNeuralNetwork:
             self,
             forward_output: list, 
             kernel_stacks: list, 
-            biases: list,
             input_x: torch.Tensor, 
-            output_range: int
+            output_range: int,
+            images_processed: int
             ):
         # compute loss
-        activation_fc = forward_output[-1][3]
+        activation_fc = torch.softmax(forward_output[-1][3], dim=0)
         
         # compute fully connected layer deltas
         biases_fc_d = None
         flattened, weights = forward_output[-1][0], forward_output[-1][1]
 
         labels = torch.tensor(self.ds['train']['label'], dtype=torch.long, device=self.device)
-        expected = torch.zeros(output_range, self.images_processed, device=self.device)
-        expected[labels[:self.images_processed], torch.arange(self.images_processed)] = 1
+        expected = torch.zeros(output_range, images_processed, device=self.device)
+        expected[labels[:images_processed], torch.arange(images_processed)] = 1
         
-        output_fc_d = activation_fc - expected #dZ, kept seperate per image
-        weights_d = output_fc_d @ flattened.squeeze() / self.images_processed #dW, averaged
-        biases_fc_d = torch.sum(output_fc_d, dim=1) / self.images_processed #dB, averaged
+        output_fc_d = activation_fc - expected #dZ
+        weights_d = output_fc_d @ flattened / images_processed #dW, averaged
+        biases_fc_d = output_fc_d.sum(dim=1) / images_processed #dB, averaged
         flattened_d = weights.T @ output_fc_d #dF, kept seperate
         
         # compute convolutional pass deltas, iterate backwards starting from last convolutional layer
         deltas = [None for _ in range(len(forward_output))]
         for i, _ in reversed(list(enumerate(forward_output[:-1]))):
-            convolution, activation, pooled = forward_output[i]
+            convolution, activation, pooled = (
+                forward_output[i][0], 
+                forward_output[i][1], 
+                forward_output[i][2]
+            )
             
             # compute delta for pooled matrix
             if i == len(kernel_stacks)-1:
@@ -374,67 +408,44 @@ class ConvolutionalNeuralNetwork:
                 prev_convolution_d_padded = F.pad(prev_convolution_d,(padding,)*4,value=0)
                 rotated_kernel = (
                     prev_kernel
-                    .flatten(0,1)
                     .rot90(2,(-2,-1))
                 )
 
-                pooled_d_temp = (
-                    self._seperate(
-                        vmap(self._traverse_matrix, in_dims=(0,0,None))(prev_convolution_d_padded, rotated_kernel, 1),
-                        self.images_processed
-                    )
-                )
-                
-                channel_f = prev_kernel.shape[0] // kernel.shape[0]
-                s = pooled_d_temp.shape
-                pooled_d = (
-                    pooled_d_temp
-                        .reshape(s[0], channel_f, s[1] // channel_f, *s[2:])
-                        .sum(2)
-                        .flatten(0,1)
-                )
+                pooled_d_vmap_single = vmap(self._traverse_matrix, in_dims=(0,0,None))
+                pooled_d_vmap_channel = vmap(pooled_d_vmap_single, in_dims=(0,0,None))
+                pooled_d = vmap(pooled_d_vmap_channel, in_dims=(0,None,None))(prev_convolution_d_padded, rotated_kernel, 1).sum(2)
 
             # compute deltas for layer 2 activations
-            activation_d = self._seperate(
-                vmap(self._max_pool_d, in_dims=(0, 0, None))(activation, pooled_d, (2,2)),
-                self.images_processed
+            s = activation.shape[:3]
+            activation_d = (
+                vmap(self._max_pool_d, in_dims=(0, 0, None))(activation.flatten(end_dim=2), pooled_d.flatten(end_dim=1), (2,2))
+                .reshape(*s, *activation.shape[3:])
             )
 
             # compute activation deltas for convolutionns
-            convolution_d_activation = self._seperate(self._relu_d(convolution), self.images_processed)
-
+            convolution_d_activation = self._relu_d(convolution)
             # compute cost deltas for convolutions
-            convolution_d = (convolution_d_activation * activation_d).flatten(0,1)
+            convolution_d = (convolution_d_activation * activation_d)
 
             if i == 0:
                 # if at the beginning convolutional layer, input tensor is the input to the convolutional neuron
-                input_t = input_x.repeat_interleave(2, dim=0) 
+                input_t = input_x.unsqueeze(1)
             else:
                 # next pooled matrix is input to convolutional neuron
-                input_t = forward_output[i-1][2].repeat_interleave(2, dim=0) 
-
+                input_t = forward_output[i-1][2]
             # compute deltas for kernels, averaged and used to update kernels
+            kernel_d_single = vmap(self._traverse_matrix, in_dims=(0,0,None))
+            kernel_d_channel = vmap(kernel_d_single, in_dims=(None,0,None))
             kernel_d = torch.mean(
-                self._seperate(
-                    vmap(self._traverse_matrix, in_dims=(0,0,None))(input_t, convolution_d, 1),
-                    self.images_processed
-                ),
+                vmap(kernel_d_channel, in_dims=(0,0,None))(input_t, convolution_d, 1),
                 dim=0
             )
 
             # compute deltas for biases, averaged and used to update biases
-            convolution_d_seperated = self._seperate(convolution_d, self.images_processed)
-            bias_d = convolution_d_seperated.sum((0,2,3)) / self.images_processed
+            bias_d = convolution_d.sum((0,3,4)) / images_processed
             self.logger.debug(bias_d.shape)
             
             deltas[i] = (convolution_d, kernel_d, bias_d)
         deltas[-1] = (weights_d, biases_fc_d)
-
-        for i in range(len(kernel_stacks)):
-            kernel_stacks[i] = kernel_stacks[i][:kernel_stacks[i].shape[0] // self.images_processed]
-            self.logger.debug(kernel_stacks[i].shape)
         
-        for i in range(len(kernel_stacks)):
-            biases[i] = biases[i][:biases[i].shape[0] // self.images_processed].squeeze(-1)
-
         return deltas

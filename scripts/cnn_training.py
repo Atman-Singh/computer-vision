@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from datasets import load_dataset, load_from_disk
-from infrastructure.convolutional_neural_network import ConvolutionalNeuralNetwork
+from infrastructure.cnn import ConvolutionalNeuralNetwork
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -17,8 +17,8 @@ def main():
     else:
         ds = load_dataset("ylecun/mnist")
         ds.save_to_disk(ds_dir)
-    cnn = ConvolutionalNeuralNetwork(28, 28, ds, 0.3)
-    cnn.train(1)
+    cnn = ConvolutionalNeuralNetwork(pool_size=(2,2), ds=ds, learning_rate=0.5, learning_rate_decay=0.75)
+    cnn.train(400)
     
 if __name__ == '__main__':
     main()
